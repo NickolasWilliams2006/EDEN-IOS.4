@@ -1,0 +1,130 @@
+# For an iOS-only repository: place the contents of ios/ at repository root.
+# For the full EDEN repository: copy this file to root .github/workflows/.
+name: EDEN iOS - hosted Mac
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eden-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  simulator:
+    name: Build and test iPhone simulator
+    runs-on: macos-15
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Locate existing iOS project
+        run: |
+          # The sources may sit at the root, under ios/, or in whatever folder
+          # the unzipped bundle was uploaded as. Find build_ios.py next to EDEN.xcodeproj.
+          found=""
+          while IFS= read -r candidate; do
+            if [[ -d "$(dirname "$candidate")/EDEN.xcodeproj" ]]; then found="$(dirname "$candidate")"; break; fi
+          done < <(find "$GITHUB_WORKSPACE" -maxdepth 4 -name build_ios.py -not -path '*/build/*' | sort)
+          if [[ -z "$found" ]]; then
+            echo 'EDEN iOS sources are missing: no build_ios.py beside EDEN.xcodeproj. Repository contents:' >&2
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -not -path '*/.git/*' | sort >&2
+            exit 1
+          fi
+          echo "Using iOS project at: $found"
+          echo "IOS_ROOT=$found" >> "$GITHUB_ENV"
+
+      - name: Record hosted toolchain
+        run: |
+          xcode-select --print-path
+          xcodebuild -version
+          xcodebuild -showsdks
+          python3 --version
+          xcrun simctl list devices available
+
+      - name: Check source and workflow helpers
+        run: |
+          python3 "$IOS_ROOT/build_ios.py" --check
+          python3 "$IOS_ROOT/ci/test_hosted.py"
+
+      - name: Compile and run native XCTest
+        run: python3 "$IOS_ROOT/build_ios.py" --test
+
+      - name: Collect build diagnostics and simulator app
+        if: ${{ always() && env.IOS_ROOT != '' }}
+        run: python3 "$IOS_ROOT/ci/hosted.py" collect
+
+      - name: Upload build results
+        if: ${{ always() && env.IOS_ROOT != '' }}
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: EDEN-ios-simulator-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.IOS_ROOT }}/build/hosted-artifacts/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+
+  ipa:
+    # Unsigned arm64 device build for Sideloadly/AltStore. Only runs once the
+    # simulator XCTest job is green, so an IPA is never produced from code that
+    # fails its own tests. No Apple signing identity or profile is involved.
+    name: Package unsigned IPA for Sideloadly
+    needs: simulator
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Locate existing iOS project
+        run: |
+          # The sources may sit at the root, under ios/, or in whatever folder
+          # the unzipped bundle was uploaded as. Find build_ios.py next to EDEN.xcodeproj.
+          found=""
+          while IFS= read -r candidate; do
+            if [[ -d "$(dirname "$candidate")/EDEN.xcodeproj" ]]; then found="$(dirname "$candidate")"; break; fi
+          done < <(find "$GITHUB_WORKSPACE" -maxdepth 4 -name build_ios.py -not -path '*/build/*' | sort)
+          if [[ -z "$found" ]]; then
+            echo 'EDEN iOS sources are missing: no build_ios.py beside EDEN.xcodeproj. Repository contents:' >&2
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -not -path '*/.git/*' | sort >&2
+            exit 1
+          fi
+          echo "Using iOS project at: $found"
+          echo "IOS_ROOT=$found" >> "$GITHUB_ENV"
+
+      - name: Record hosted toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Build unsigned device app and package IPA
+        run: python3 "$IOS_ROOT/build_ios.py" --ipa
+
+      - name: Collect IPA and diagnostics
+        if: ${{ always() && env.IOS_ROOT != '' }}
+        run: python3 "$IOS_ROOT/ci/hosted.py" collect
+
+      - name: Upload unsigned IPA
+        if: ${{ always() && env.IOS_ROOT != '' }}
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: EDEN-ios-unsigned-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.IOS_ROOT }}/build/hosted-artifacts/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
